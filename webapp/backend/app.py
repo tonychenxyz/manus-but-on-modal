@@ -301,11 +301,11 @@ async def connect(request: Request) -> ConnectResponse:
         import modal
 
         # Ensure Agent Home is running
-        ensure_fn = modal.Function.lookup(
+        ensure_fn = modal.Function.from_name(
             settings.agent_home_modal_app,
             "ensure_agent_home_running",
         )
-        status_result = ensure_fn.remote()
+        status_result = await ensure_fn.remote()
 
         if status_result.get("status") == "error":
             raise HTTPException(
@@ -314,15 +314,23 @@ async def connect(request: Request) -> ConnectResponse:
             )
 
         # Mint access token
-        mint_fn = modal.Function.lookup(
+        mint_fn = modal.Function.from_name(
             settings.agent_home_modal_app,
             "mint_access_token",
         )
-        token_result = mint_fn.remote(user.email)
+        token_result = await mint_fn.remote(user.email)
 
         # Get Agent Home URL from Modal
-        cls = modal.Cls.lookup(settings.agent_home_modal_app, "AgentHomeSandbox")
-        agent_home_url = cls.web_url
+        web_fn = modal.Function.from_name(
+            settings.agent_home_modal_app,
+            "AgentHomeSandbox.web",
+        )
+        agent_home_url = await web_fn.get_web_url()
+        if not agent_home_url:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Agent Home URL not available",
+            )
 
         return ConnectResponse(
             agent_home_url=agent_home_url,
@@ -358,11 +366,11 @@ async def get_agent_home_status(request: Request) -> dict[str, Any]:
     try:
         import modal
 
-        ensure_fn = modal.Function.lookup(
+        ensure_fn = modal.Function.from_name(
             settings.agent_home_modal_app,
             "ensure_agent_home_running",
         )
-        result = ensure_fn.remote()
+        result = await ensure_fn.remote()
         return result
 
     except Exception as e:

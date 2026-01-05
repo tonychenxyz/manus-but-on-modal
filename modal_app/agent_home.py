@@ -214,7 +214,7 @@ def ensure_agent_home_running() -> dict:
     """
     # Get the web endpoint URL
     # The AgentHomeSandbox.web endpoint is automatically available
-    cls = modal.Cls.lookup("agent-home-orchestrator", "AgentHomeSandbox")
+    cls = modal.Cls.from_name("agent-home-orchestrator", "AgentHomeSandbox")
 
     # This will start the container if not running
     try:

@@ -37,6 +37,7 @@ agent_home_image = (
         # HTTP client
         "httpx>=0.28.0",
     )
+    .add_local_python_source("modal_app")
     .add_local_python_source("shared")
     .add_local_python_source("agent_home")
 )
@@ -55,6 +56,7 @@ worker_image = (
         # Common language toolchains
         "uv",  # Python package manager
     )
+    .add_local_python_source("modal_app")
     .add_local_python_source("shared")
     .add_local_python_source("workers")
 )

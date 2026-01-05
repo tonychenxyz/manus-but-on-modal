@@ -112,6 +112,7 @@ WEBAPP_AGENT_HOME_MODAL_APP=agent-home-orchestrator
 
 ```bash
 # Backend
+python3 -m venv .venv && source .venv/bin/activate
 cd webapp/backend
 uvicorn app:app --reload --port 8000
 
