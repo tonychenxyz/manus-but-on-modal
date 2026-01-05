@@ -44,7 +44,7 @@ Agent Home is a system that provides:
 
 ### Webapp
 
-- Google OAuth authentication (single-tenant allowlist)
+- Email/password authentication
 - Conversations list, chat view, run approval UI
 - Direct WebSocket connection to Agent Home for real-time updates
 
@@ -61,14 +61,13 @@ Agent Home is a system that provides:
 - Clone repos, run tests/builds, make changes, create PRs
 - Full Claude agent with code tools inside each worker
 
-## Setup
+## Quick Start
 
 ### Prerequisites
 
 - Python 3.11+
 - Node.js 18+ (for frontend)
 - Modal account with CLI configured
-- Google Cloud project with OAuth 2.0 credentials
 - Anthropic API key
 
 ### 1. Install Dependencies
@@ -90,10 +89,7 @@ Create a Modal secret named `agent-home-secrets`:
 modal secret create agent-home-secrets \
   ANTHROPIC_API_KEY=your_anthropic_key \
   GITHUB_TOKEN=your_github_token \
-  AGENT_HOME_JWT_SECRET=your_jwt_secret \
-  AGENT_HOME_GOOGLE_CLIENT_ID=your_google_client_id \
-  AGENT_HOME_GOOGLE_CLIENT_SECRET=your_google_client_secret \
-  AGENT_HOME_ALLOWED_EMAILS=your@email.com
+  AGENT_HOME_JWT_SECRET=$(openssl rand -hex 32)
 ```
 
 ### 3. Deploy to Modal
@@ -102,9 +98,17 @@ modal secret create agent-home-secrets \
 modal deploy modal_app/agent_home.py
 ```
 
-### 4. Run the Webapp
+### 4. Configure Webapp
 
-For development:
+Create `webapp/backend/.env`:
+
+```bash
+WEBAPP_ADMIN_EMAIL=admin@example.com
+WEBAPP_ADMIN_PASSWORD=changeme
+WEBAPP_AGENT_HOME_MODAL_APP=agent-home-orchestrator
+```
+
+### 5. Run the Webapp
 
 ```bash
 # Backend
@@ -116,14 +120,13 @@ cd webapp/frontend
 npm run dev
 ```
 
-For production, build the frontend and serve from the backend:
+### 6. Login
 
-```bash
-cd webapp/frontend
-npm run build
-cd ../backend
-uvicorn app:app --host 0.0.0.0 --port 8000
-```
+Open `http://localhost:3000` and login with:
+- Email: `admin@example.com`
+- Password: `changeme`
+
+See [SETUP.md](SETUP.md) for detailed setup instructions.
 
 ## Usage
 
@@ -195,16 +198,23 @@ Connect to `/v1/stream?conversation_id={id}&token={token}` to receive real-time 
 
 ### Environment Variables
 
+#### Modal Secrets (for Agent Home)
+
 | Variable | Description |
 |----------|-------------|
 | `ANTHROPIC_API_KEY` | Anthropic API key |
 | `GITHUB_TOKEN` | GitHub token for repo access |
 | `AGENT_HOME_JWT_SECRET` | Secret for JWT tokens |
-| `AGENT_HOME_GOOGLE_CLIENT_ID` | Google OAuth client ID |
-| `AGENT_HOME_GOOGLE_CLIENT_SECRET` | Google OAuth client secret |
-| `AGENT_HOME_ALLOWED_EMAILS` | Comma-separated list of allowed emails |
-| `AGENT_HOME_ORCHESTRATOR_MODEL` | Claude model for orchestrator (default: claude-sonnet-4-20250514) |
-| `AGENT_HOME_WORKER_MODEL` | Claude model for workers (default: claude-sonnet-4-20250514) |
+
+#### Webapp Backend (.env)
+
+| Variable | Description |
+|----------|-------------|
+| `WEBAPP_ADMIN_EMAIL` | Admin login email (default: admin@example.com) |
+| `WEBAPP_ADMIN_PASSWORD` | Admin login password (default: changeme) |
+| `WEBAPP_JWT_SECRET` | Secret for session tokens (auto-generated if not set) |
+| `WEBAPP_AGENT_HOME_MODAL_APP` | Modal app name (default: agent-home-orchestrator) |
+| `WEBAPP_COOKIE_SECURE` | Set to true for HTTPS (default: false) |
 
 ## Memory and Persistence
 
