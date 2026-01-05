@@ -1,0 +1,50 @@
+[project]
+name = "agent-home-orchestrator"
+version = "0.1.0"
+description = "Persistent Agent Home Orchestrator with Async Multi-Chat and Ephemeral Modal Worker Sandboxes"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    # Modal for compute
+    "modal>=0.68.0",
+    # Anthropic Agent SDK
+    "anthropic>=0.42.0",
+    # Web framework
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "websockets>=13.0",
+    # Auth
+    "python-jose[cryptography]>=3.3.0",
+    "google-auth>=2.36.0",
+    "google-auth-oauthlib>=1.2.0",
+    # Database
+    "aiosqlite>=0.20.0",
+    # Utilities
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.6.0",
+    "httpx>=0.28.0",
+    "python-multipart>=0.0.18",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.8.0",
+    "mypy>=1.13.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
