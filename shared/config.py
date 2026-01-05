@@ -44,9 +44,6 @@ class Settings(BaseSettings):
     max_queued_runs_per_conversation: int = 5
 
     # Auth settings
-    google_client_id: str = ""
-    google_client_secret: str = ""
-    allowed_emails: list[str] = []
     jwt_secret: str = ""
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 60
