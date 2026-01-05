@@ -30,12 +30,31 @@ export function useAuth() {
     fetchUser()
   }, [fetchUser])
 
-  const login = useCallback(() => {
-    window.location.href = '/auth/login'
+  const login = useCallback(async (email: string, password: string) => {
+    const response = await fetch('/auth/login', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      credentials: 'include',
+      body: JSON.stringify({ email, password }),
+    })
+
+    if (!response.ok) {
+      const data = await response.json()
+      throw new Error(data.detail || 'Login failed')
+    }
+
+    const data = await response.json()
+    setUser(data.user)
   }, [])
 
-  const logout = useCallback(() => {
-    window.location.href = '/auth/logout'
+  const logout = useCallback(async () => {
+    await fetch('/auth/logout', {
+      method: 'POST',
+      credentials: 'include',
+    })
+    setUser(null)
   }, [])
 
   return {

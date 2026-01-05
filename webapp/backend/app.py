@@ -1,7 +1,7 @@
 """Webapp backend for Agent Home.
 
 Handles:
-- Google OAuth authentication
+- Email/password authentication
 - Minting access tokens for Agent Home connection
 - Ensuring Agent Home is running
 - Serving the frontend
@@ -9,20 +9,19 @@ Handles:
 
 from __future__ import annotations
 
+import hashlib
 import logging
-import os
+import secrets
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
 
-import httpx
 from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from jose import jwt
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
@@ -36,13 +35,9 @@ class WebappSettings(BaseSettings):
         env_file=".env",
     )
 
-    # Google OAuth
-    google_client_id: str = ""
-    google_client_secret: str = ""
-    google_redirect_uri: str = "http://localhost:8000/auth/callback"
-
-    # Allowed users (comma-separated emails)
-    allowed_emails: str = ""
+    # Admin user credentials (set these in .env)
+    admin_email: str = "admin@example.com"
+    admin_password: str = "changeme"  # Change this!
 
     # JWT settings
     jwt_secret: str = ""
@@ -58,15 +53,13 @@ class WebappSettings(BaseSettings):
     # Frontend
     frontend_url: str = "http://localhost:3000"
 
-    @property
-    def allowed_email_list(self) -> list[str]:
-        """Get list of allowed emails."""
-        if not self.allowed_emails:
-            return []
-        return [e.strip() for e in self.allowed_emails.split(",")]
-
 
 settings = WebappSettings()
+
+# Generate JWT secret if not set
+if not settings.jwt_secret:
+    settings.jwt_secret = secrets.token_hex(32)
+    logger.warning("JWT_SECRET not set, using randomly generated secret (sessions won't persist across restarts)")
 
 app = FastAPI(
     title="Agent Home Webapp",
@@ -76,7 +69,7 @@ app = FastAPI(
 # CORS for frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.frontend_url, "http://localhost:3000"],
+    allow_origins=[settings.frontend_url, "http://localhost:3000", "http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -87,22 +80,40 @@ app.add_middleware(
 SESSION_COOKIE = "agent_home_session"
 
 
+def hash_password(password: str) -> str:
+    """Hash a password using SHA-256."""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+
 class SessionData(BaseModel):
     """Session data stored in JWT."""
 
     email: str
     name: str
-    picture: str | None = None
     exp: datetime
 
 
-def create_session_token(email: str, name: str, picture: str | None = None) -> str:
+class LoginRequest(BaseModel):
+    """Login request body."""
+
+    email: EmailStr
+    password: str
+
+
+class LoginResponse(BaseModel):
+    """Login response."""
+
+    success: bool
+    message: str
+    user: dict[str, Any] | None = None
+
+
+def create_session_token(email: str, name: str) -> str:
     """Create a session JWT token.
 
     Args:
         email: User email
         name: User name
-        picture: Profile picture URL
 
     Returns:
         JWT token
@@ -111,7 +122,6 @@ def create_session_token(email: str, name: str, picture: str | None = None) -> s
     payload = {
         "email": email,
         "name": name,
-        "picture": picture,
         "exp": expire,
     }
     return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
@@ -176,101 +186,62 @@ def require_auth(request: Request) -> SessionData:
 # ============================================================================
 
 
-@app.get("/auth/login")
-async def login() -> RedirectResponse:
-    """Redirect to Google OAuth."""
-    params = {
-        "client_id": settings.google_client_id,
-        "redirect_uri": settings.google_redirect_uri,
-        "response_type": "code",
-        "scope": "openid email profile",
-        "access_type": "offline",
-        "prompt": "consent",
-    }
-    url = f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}"
-    return RedirectResponse(url)
-
-
-@app.get("/auth/callback")
-async def auth_callback(code: str, response: Response) -> RedirectResponse:
-    """Handle Google OAuth callback.
+@app.post("/auth/login")
+async def login(request: LoginRequest) -> JSONResponse:
+    """Login with email and password.
 
     Args:
-        code: Authorization code from Google
-        response: FastAPI response
+        request: Login request with email and password
 
     Returns:
-        Redirect to frontend
+        JSON response with session cookie
     """
-    # Exchange code for tokens
-    async with httpx.AsyncClient() as client:
-        token_response = await client.post(
-            "https://oauth2.googleapis.com/token",
-            data={
-                "client_id": settings.google_client_id,
-                "client_secret": settings.google_client_secret,
-                "code": code,
-                "grant_type": "authorization_code",
-                "redirect_uri": settings.google_redirect_uri,
-            },
+    # Check credentials against admin user
+    if (
+        request.email == settings.admin_email
+        and request.password == settings.admin_password
+    ):
+        # Create session token
+        session_token = create_session_token(
+            email=request.email,
+            name=request.email.split("@")[0],  # Use part before @ as name
         )
 
-        if token_response.status_code != 200:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Failed to exchange code for token",
-            )
-
-        tokens = token_response.json()
-
-        # Get user info
-        userinfo_response = await client.get(
-            "https://www.googleapis.com/oauth2/v2/userinfo",
-            headers={"Authorization": f"Bearer {tokens['access_token']}"},
+        # Create response with cookie
+        response = JSONResponse(
+            content={
+                "success": True,
+                "message": "Login successful",
+                "user": {
+                    "email": request.email,
+                    "name": request.email.split("@")[0],
+                },
+            }
+        )
+        response.set_cookie(
+            key=SESSION_COOKIE,
+            value=session_token,
+            httponly=True,
+            secure=settings.cookie_secure,
+            samesite="lax",
+            max_age=settings.session_expire_hours * 3600,
         )
 
-        if userinfo_response.status_code != 200:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Failed to get user info",
-            )
+        return response
 
-        userinfo = userinfo_response.json()
-
-    email = userinfo.get("email")
-    name = userinfo.get("name", email)
-    picture = userinfo.get("picture")
-
-    # Check if email is allowed
-    if settings.allowed_email_list and email not in settings.allowed_email_list:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Email {email} is not authorized",
-        )
-
-    # Create session
-    session_token = create_session_token(email, name, picture)
-
-    # Redirect to frontend with session cookie
-    redirect = RedirectResponse(url=settings.frontend_url, status_code=302)
-    redirect.set_cookie(
-        key=SESSION_COOKIE,
-        value=session_token,
-        httponly=True,
-        secure=settings.cookie_secure,
-        samesite="lax",
-        max_age=settings.session_expire_hours * 3600,
+    # Invalid credentials
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid email or password",
     )
 
-    return redirect
 
-
-@app.get("/auth/logout")
-async def logout() -> RedirectResponse:
+@app.post("/auth/logout")
+async def logout() -> JSONResponse:
     """Log out by clearing session cookie."""
-    redirect = RedirectResponse(url=settings.frontend_url, status_code=302)
-    redirect.delete_cookie(key=SESSION_COOKIE)
-    return redirect
+    response = JSONResponse(content={"success": True, "message": "Logged out"})
+    response.delete_cookie(key=SESSION_COOKIE)
+    return response
 
 
 @app.get("/auth/me")
@@ -293,7 +264,6 @@ async def get_me(request: Request) -> dict[str, Any]:
     return {
         "email": user.email,
         "name": user.name,
-        "picture": user.picture,
     }
 
 
