@@ -20,14 +20,21 @@ agent_home_volume = modal.Volume.from_name(
 agent_home_image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
+        # Claude Agent SDK (Claude Code as a library)
+        "claude-agent-sdk>=0.1.0",
         "anthropic>=0.42.0",
+        # Web framework
         "fastapi>=0.115.0",
         "uvicorn[standard]>=0.32.0",
         "websockets>=13.0",
+        # Database
         "aiosqlite>=0.20.0",
+        # Data validation
         "pydantic>=2.10.0",
         "pydantic-settings>=2.6.0",
+        # Auth
         "python-jose[cryptography]>=3.3.0",
+        # HTTP client
         "httpx>=0.28.0",
     )
     .add_local_python_source("shared")
@@ -39,7 +46,10 @@ worker_image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git", "curl", "gh")
     .pip_install(
+        # Claude Agent SDK (Claude Code as a library)
+        "claude-agent-sdk>=0.1.0",
         "anthropic>=0.42.0",
+        # Data validation
         "pydantic>=2.10.0",
         "pydantic-settings>=2.6.0",
         # Common language toolchains

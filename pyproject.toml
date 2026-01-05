@@ -7,7 +7,8 @@ requires-python = ">=3.11"
 dependencies = [
     # Modal for compute
     "modal>=0.68.0",
-    # Anthropic Agent SDK
+    # Anthropic Agent SDK (Claude Code as a library)
+    "claude-agent-sdk>=0.1.0",
     "anthropic>=0.42.0",
     # Web framework
     "fastapi>=0.115.0",

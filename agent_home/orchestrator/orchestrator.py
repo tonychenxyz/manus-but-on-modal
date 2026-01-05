@@ -1,21 +1,30 @@
 """Home Orchestrator - The brain of Agent Home.
 
-Uses the Anthropic API to process user messages, generate plans, and coordinate
-worker sandbox execution.
+Uses the Claude Agent SDK (ClaudeSDKClient) for session-based conversations
+to process user messages, generate plans, and coordinate worker sandbox execution.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import anthropic
+from claude_agent_sdk import (
+    ClaudeSDKClient,
+    ClaudeAgentOptions,
+    AssistantMessage,
+    TextBlock,
+    ToolUseBlock,
+    ResultMessage,
+)
 
-from agent_home.orchestrator.tools import ORCHESTRATOR_TOOLS, OrchestratorToolHandler
+from agent_home.orchestrator.mcp_tools import (
+    create_orchestrator_mcp_server,
+    ORCHESTRATOR_TOOL_NAMES,
+)
 from shared.config import get_settings
 from shared.models import (
     ConversationStatus,
@@ -66,8 +75,8 @@ Use self-prompts to remind yourself of things to follow up on."""
 class HomeOrchestrator:
     """Orchestrates conversation processing and worker coordination.
 
-    Uses the Anthropic API for planning and response generation, coordinating
-    with worker sandboxes for actual code execution.
+    Uses the Claude Agent SDK's ClaudeSDKClient for session-based conversations,
+    coordinating with worker sandboxes for actual code execution.
     """
 
     def __init__(
@@ -91,19 +100,55 @@ class HomeOrchestrator:
         self.worker_spawner = worker_spawner
 
         settings = get_settings()
-        self.client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
         self.model = settings.orchestrator_model
 
-        self.tool_handler = OrchestratorToolHandler(
+        # Track pending workers during planning
+        self._pending_workers: list[dict[str, Any]] = []
+
+        # Create MCP server with orchestrator tools
+        self.mcp_server = create_orchestrator_mcp_server(
             memory_path=memory_path,
             state_manager=state_manager,
             event_store=event_store,
-            worker_spawner=worker_spawner,
+            pending_workers_callback=self._on_pending_worker,
         )
 
-        # Track active runs for cancellation
+        # Track active sessions and tasks for cancellation
+        self._active_sessions: dict[str, ClaudeSDKClient] = {}
         self._active_tasks: dict[str, asyncio.Task[Any]] = {}
         self._cancelled_runs: set[str] = set()
+
+    def _on_pending_worker(self, worker: dict[str, Any]) -> None:
+        """Callback when a worker is queued during planning."""
+        self._pending_workers.append(worker)
+
+    def _get_agent_options(
+        self,
+        session_id: str | None = None,
+        permission_mode: str = "acceptEdits",
+    ) -> ClaudeAgentOptions:
+        """Get ClaudeAgentOptions for the orchestrator.
+
+        Args:
+            session_id: Optional session ID to resume
+            permission_mode: Permission mode for the agent
+
+        Returns:
+            Configured ClaudeAgentOptions
+        """
+        options = ClaudeAgentOptions(
+            model=self.model,
+            system_prompt=SYSTEM_PROMPT,
+            permission_mode=permission_mode,
+            max_turns=50,
+            mcp_servers={"orchestrator": self.mcp_server},
+            allowed_tools=ORCHESTRATOR_TOOL_NAMES,
+        )
+
+        if session_id:
+            options.resume = session_id
+
+        return options
 
     async def start_planning(self, run: Run) -> None:
         """Start the planning phase for a run.
@@ -124,23 +169,29 @@ class HomeOrchestrator:
             self._active_tasks.pop(run.run_id, None)
 
     async def _planning_loop(self, run: Run) -> None:
-        """Internal planning loop.
+        """Internal planning loop using ClaudeSDKClient.
 
         Args:
             run: The run to plan
         """
         logger.info(f"Starting planning for run {run.run_id}")
 
-        try:
-            # Build conversation history
-            messages = await self._build_conversation_history(run.conversation_id)
+        # Clear pending workers
+        self._pending_workers.clear()
 
-            # Add planning instruction
+        try:
+            # Build conversation context
+            history = await self._build_conversation_history(run.conversation_id)
+
+            # Create planning prompt
             planning_prompt = f"""The user has sent a new message:
 
 <user_message>
 {run.user_message}
 </user_message>
+
+Previous conversation context:
+{history}
 
 Please analyze this request and create a plan. Your plan should:
 1. Describe what needs to be done
@@ -152,89 +203,62 @@ If it requires code work, use spawn_worker to define the jobs needed.
 
 After creating the plan, the user will need to approve it before execution begins."""
 
-            messages.append({"role": "user", "content": planning_prompt})
+            # Create client with options
+            options = self._get_agent_options(permission_mode="acceptEdits")
 
-            # Run the planning conversation with tool use
             plan_text = ""
-            all_tool_calls: list[dict[str, Any]] = []
 
-            while True:
-                if run.run_id in self._cancelled_runs:
-                    raise asyncio.CancelledError()
+            async with ClaudeSDKClient(options=options) as client:
+                # Store session for potential cancellation
+                self._active_sessions[run.run_id] = client
 
-                response = self.client.messages.create(
-                    model=self.model,
-                    max_tokens=4096,
-                    system=SYSTEM_PROMPT,
-                    tools=ORCHESTRATOR_TOOLS,  # type: ignore
-                    messages=messages,  # type: ignore
-                )
+                # Send the planning query
+                await client.query(planning_prompt)
 
-                # Process response blocks
-                assistant_content: list[dict[str, Any]] = []
-                tool_results: list[dict[str, Any]] = []
+                # Process responses
+                async for message in client.receive_response():
+                    if run.run_id in self._cancelled_runs:
+                        await client.interrupt()
+                        raise asyncio.CancelledError()
 
-                for block in response.content:
-                    if block.type == "text":
-                        plan_text += block.text
-                        assistant_content.append({
-                            "type": "text",
-                            "text": block.text,
-                        })
+                    if isinstance(message, AssistantMessage):
+                        for block in message.content:
+                            if isinstance(block, TextBlock):
+                                plan_text += block.text
 
-                        # Stream thinking to events
-                        await self.event_store.append(
-                            Event(
-                                cursor=0,
-                                conversation_id=run.conversation_id,
-                                type=EventType.ASSISTANT_THINKING,
-                                payload={"content": block.text},
-                                run_id=run.run_id,
-                            )
+                                # Stream thinking to events
+                                await self.event_store.append(
+                                    Event(
+                                        cursor=0,
+                                        conversation_id=run.conversation_id,
+                                        type=EventType.ASSISTANT_THINKING,
+                                        payload={"content": block.text},
+                                        run_id=run.run_id,
+                                    )
+                                )
+
+                            elif isinstance(block, ToolUseBlock):
+                                logger.debug(
+                                    f"Tool call: {block.name} with {block.input}"
+                                )
+
+                    elif isinstance(message, ResultMessage):
+                        logger.info(
+                            f"Planning completed: {message.num_turns} turns, "
+                            f"{message.duration_ms}ms"
                         )
 
-                    elif block.type == "tool_use":
-                        all_tool_calls.append({
-                            "id": block.id,
-                            "name": block.name,
-                            "input": block.input,
-                        })
-                        assistant_content.append({
-                            "type": "tool_use",
-                            "id": block.id,
-                            "name": block.name,
-                            "input": block.input,
-                        })
+                # Remove session reference
+                self._active_sessions.pop(run.run_id, None)
 
-                        # Execute the tool
-                        result = await self.tool_handler.handle_tool(
-                            block.name,
-                            block.input,  # type: ignore
-                            run.run_id,
-                        )
-
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": result,
-                        })
-
-                # Add assistant response to messages
-                messages.append({"role": "assistant", "content": assistant_content})
-
-                # If there were tool calls, add results and continue
-                if tool_results:
-                    messages.append({"role": "user", "content": tool_results})
-                else:
-                    # No more tool calls, planning complete
-                    break
-
-                if response.stop_reason == "end_turn":
-                    break
-
-            # Collect pending workers from tool calls
-            pending_workers = self.tool_handler.get_pending_workers()
+            # Collect pending workers from MCP server
+            pending_workers = self.mcp_server.get_pending_workers()  # type: ignore
             job_specs = [w["spec"] for w in pending_workers]
+
+            # Also include any from our callback
+            for w in self._pending_workers:
+                if w["spec"] not in job_specs:
+                    job_specs.append(w["spec"])
 
             # Update run with plan
             await self.state_manager.update_run(
@@ -349,7 +373,7 @@ After creating the plan, the user will need to approve it before execution begin
             if run.run_id in self._cancelled_runs:
                 raise asyncio.CancelledError()
 
-            # Generate summary response
+            # Generate summary response using Agent SDK
             summary = await self._generate_summary(run, results)
 
             # Emit assistant message
@@ -483,8 +507,6 @@ After creating the plan, the user will need to approve it before execution begin
         Returns:
             List of completed worker jobs
         """
-        from shared.models import WorkerResult
-
         completed: list[WorkerJob] = []
 
         while len(completed) < len(job_ids):
@@ -534,7 +556,7 @@ After creating the plan, the user will need to approve it before execution begin
     async def _generate_summary(
         self, run: Run, worker_jobs: list[WorkerJob]
     ) -> str:
-        """Generate a summary of the run results.
+        """Generate a summary of the run results using Agent SDK.
 
         Args:
             run: The completed run
@@ -563,11 +585,8 @@ After creating the plan, the user will need to approve it before execution begin
         if not results_text:
             return "Task completed. No worker jobs were needed."
 
-        # Use Claude to generate a natural summary
-        messages = [
-            {
-                "role": "user",
-                "content": f"""Please provide a brief, friendly summary of the following task results for the user.
+        # Use Agent SDK to generate a natural summary
+        prompt = f"""Please provide a brief, friendly summary of the following task results for the user.
 
 Original request: {run.user_message}
 
@@ -576,26 +595,33 @@ Plan: {run.plan}
 Worker Results:
 {chr(10).join(results_text)}
 
-Keep the summary concise and highlight the key outcomes (like PR links).""",
-            }
-        ]
+Keep the summary concise and highlight the key outcomes (like PR links)."""
 
         try:
-            response = self.client.messages.create(
+            options = ClaudeAgentOptions(
                 model=self.model,
-                max_tokens=1024,
-                system="You are a helpful assistant summarizing task results. Be concise and friendly.",
-                messages=messages,  # type: ignore
+                system_prompt="You are a helpful assistant summarizing task results. Be concise and friendly.",
+                max_turns=1,
             )
 
-            for block in response.content:
-                if block.type == "text":
-                    return block.text
+            summary = ""
+            async with ClaudeSDKClient(options=options) as client:
+                await client.query(prompt)
+
+                async for message in client.receive_response():
+                    if isinstance(message, AssistantMessage):
+                        for block in message.content:
+                            if isinstance(block, TextBlock):
+                                summary += block.text
+
+            return summary if summary else self._fallback_summary(results_text)
 
         except Exception as e:
-            logger.warning(f"Failed to generate summary with Claude: {e}")
+            logger.warning(f"Failed to generate summary with Agent SDK: {e}")
+            return self._fallback_summary(results_text)
 
-        # Fallback to simple summary
+    def _fallback_summary(self, results_text: list[str]) -> str:
+        """Generate a simple fallback summary."""
         return f"## Results\n\n" + "\n".join(results_text)
 
     async def cancel_run(self, run: Run) -> None:
@@ -607,6 +633,14 @@ Keep the summary concise and highlight the key outcomes (like PR links).""",
         logger.info(f"Cancelling run {run.run_id}")
 
         self._cancelled_runs.add(run.run_id)
+
+        # Interrupt active session if any
+        session = self._active_sessions.get(run.run_id)
+        if session:
+            try:
+                await session.interrupt()
+            except Exception as e:
+                logger.warning(f"Failed to interrupt session: {e}")
 
         # Cancel the active task
         task = self._active_tasks.get(run.run_id)
@@ -622,10 +656,6 @@ Keep the summary concise and highlight the key outcomes (like PR links).""",
                     status=WorkerJobStatus.CANCELLED,
                     completed_at=datetime.utcnow(),
                 )
-
-                # TODO: Actually cancel the Modal sandbox
-                # if job.sandbox_id and self.worker_canceller:
-                #     await self.worker_canceller(job.sandbox_id)
 
     async def _fail_run(self, run: Run, error: str) -> None:
         """Mark a run as failed.
@@ -658,36 +688,29 @@ Keep the summary concise and highlight the key outcomes (like PR links).""",
 
     async def _build_conversation_history(
         self, conversation_id: str
-    ) -> list[dict[str, Any]]:
-        """Build conversation history for Claude.
+    ) -> str:
+        """Build conversation history string for context.
 
         Args:
             conversation_id: The conversation ID
 
         Returns:
-            List of messages in Claude format
+            Formatted history string
         """
         events = await self.event_store.get_events(
             conversation_id=conversation_id,
             after=0,
-            limit=100,
+            limit=50,
             event_types=[EventType.MESSAGE_USER, EventType.MESSAGE_ASSISTANT],
         )
 
-        messages: list[dict[str, Any]] = []
+        history_parts = []
         for event in events:
-            if event.type == EventType.MESSAGE_USER:
-                messages.append({
-                    "role": "user",
-                    "content": event.payload.get("content", ""),
-                })
-            elif event.type == EventType.MESSAGE_ASSISTANT:
-                messages.append({
-                    "role": "assistant",
-                    "content": event.payload.get("content", ""),
-                })
+            role = "User" if event.type == EventType.MESSAGE_USER else "Assistant"
+            content = event.payload.get("content", "")[:500]  # Truncate long messages
+            history_parts.append(f"{role}: {content}")
 
-        return messages
+        return "\n\n".join(history_parts) if history_parts else "No previous messages."
 
     async def resume_active_runs(self) -> None:
         """Resume any runs that were active when Agent Home restarted.
