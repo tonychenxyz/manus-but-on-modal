@@ -49,6 +49,9 @@ class WebappSettings(BaseSettings):
     jwt_algorithm: str = "HS256"
     session_expire_hours: int = 24
 
+    # Cookie settings
+    cookie_secure: bool = False  # Set True in production with HTTPS
+
     # Agent Home
     agent_home_modal_app: str = "agent-home-orchestrator"
 
@@ -254,7 +257,7 @@ async def auth_callback(code: str, response: Response) -> RedirectResponse:
         key=SESSION_COOKIE,
         value=session_token,
         httponly=True,
-        secure=True,  # Set to False for local development
+        secure=settings.cookie_secure,
         samesite="lax",
         max_age=settings.session_expire_hours * 3600,
     )
@@ -414,10 +417,13 @@ async def health() -> dict[str, str]:
 # Frontend Serving (for production)
 # ============================================================================
 
-# If frontend build exists, serve it
-frontend_build = Path(__file__).parent.parent / "frontend" / "build"
+# If frontend build exists, serve it (Vite outputs to 'dist')
+frontend_build = Path(__file__).parent.parent / "frontend" / "dist"
 if frontend_build.exists():
-    app.mount("/static", StaticFiles(directory=frontend_build / "static"), name="static")
+    # Serve static assets
+    assets_dir = frontend_build / "assets"
+    if assets_dir.exists():
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
 
     @app.get("/{full_path:path}")
     async def serve_frontend(full_path: str) -> HTMLResponse:
